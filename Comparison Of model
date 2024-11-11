@@ -1,0 +1,205 @@
+
+
+# Import necessary libraries
+import torch
+import torchvision
+import matplotlib.pyplot as plt
+import cv2
+import numpy as np
+import time
+import psutil
+import GPUtil
+import seaborn as sns
+from pycocotools.coco import COCO
+from torchvision.models.detection import fasterrcnn_resnet50_fpn, ssd300_vgg16
+from ultralytics import YOLO
+from PIL import Image
+from torchvision.transforms import functional as F
+
+# Load COCO dataset
+def load_coco_dataset():
+    ann_file = '/content/annotations/instances_val2017.json'  # COCO annotations
+    coco = COCO(ann_file)
+    img_dir = '/content/val2017/'
+    return coco, img_dir
+
+# Define function to evaluate each model's performance
+def evaluate_model(model, coco, img_dir, model_name, num_images=10, confidence_threshold=0.5):
+    inference_times = []
+    precision_list = []
+    recall_list = []
+    memory_consumption = []
+    cpu_utilization = []
+    gpu_utilization = []
+
+    for i, img_id in enumerate(coco.imgs.keys()):
+        if i >= num_images: break  # Limit number of images
+        img_data = coco.loadImgs(img_id)[0]
+        img_path = img_dir + img_data['file_name']
+        img = Image.open(img_path).convert('RGB')
+        img_tensor = F.to_tensor(img).unsqueeze(0)
+
+        # Measure resource usage before inference
+        cpu_before = psutil.cpu_percent()
+        mem_before = psutil.virtual_memory().percent
+        gpu_before = GPUtil.getGPUs()[0].memoryUtil if GPUtil.getGPUs() else 0
+
+        # Measure inference time
+        start_time = time.time()
+        with torch.no_grad():
+            if model_name == "YOLO":
+                predictions = model(img_path)
+            else:
+                predictions = model(img_tensor)
+
+        inference_time = time.time() - start_time
+        inference_times.append(inference_time)
+
+        # Measure resource usage after inference
+        cpu_after = psutil.cpu_percent()
+        mem_after = psutil.virtual_memory().percent
+        gpu_after = GPUtil.getGPUs()[0].memoryUtil if GPUtil.getGPUs() else 0
+
+        cpu_utilization.append(cpu_after - cpu_before)
+        memory_consumption.append(mem_after - mem_before)
+        gpu_utilization.append(gpu_after - gpu_before)
+
+        # Extract boxes, labels, and scores
+        if model_name == "YOLO":
+            boxes, scores, labels = extract_yolo_boxes(predictions)
+        else:
+            boxes, scores, labels = extract_ssd_rcnn_boxes(predictions)
+
+        # Evaluate precision, recall, etc. based on COCO annotations
+        gt_boxes = [ann['bbox'] for ann in coco.loadAnns(coco.getAnnIds(imgIds=img_id, iscrowd=False))]
+        precision, recall = calculate_precision_recall(gt_boxes, boxes, scores, labels, confidence_threshold)
+        precision_list.append(precision)
+        recall_list.append(recall)
+
+    avg_precision = np.mean(precision_list)
+    avg_recall = np.mean(recall_list)
+    avg_inference_time = np.mean(inference_times)
+    avg_memory_consumption = np.mean(memory_consumption)
+    avg_cpu_utilization = np.mean(cpu_utilization)
+    avg_gpu_utilization = np.mean(gpu_utilization)
+    fps = 1 / avg_inference_time
+
+    # Include model_name in the return dictionary
+    return {
+        'name': model_name,  # <-- Add model name here
+        'precision': avg_precision,
+        'recall': avg_recall,
+        'inference_time': avg_inference_time,
+        'fps': fps,
+        'memory': avg_memory_consumption,
+        'cpu': avg_cpu_utilization,
+        'gpu': avg_gpu_utilization
+    }
+
+
+# Function to extract boxes for SSD and Faster R-CNN
+def extract_ssd_rcnn_boxes(predictions):
+    pred_boxes = predictions[0]['boxes'].cpu().numpy()
+    pred_scores = predictions[0]['scores'].cpu().numpy()
+    pred_labels = predictions[0]['labels'].cpu().numpy()
+    return pred_boxes, pred_scores, pred_labels
+
+# Function to extract boxes for YOLO
+def extract_yolo_boxes(results):
+    boxes = []
+    scores = []
+    labels = []
+    for result in results:
+        for box in result.boxes:
+            boxes.append(box.xyxy[0].cpu().numpy())
+            scores.append(box.conf.cpu().numpy())
+            labels.append(int(box.cls))
+    return boxes, scores, labels
+
+# Precision and recall calculation based on Intersection over Union (IoU)
+def calculate_precision_recall(gt_boxes, pred_boxes, pred_scores, pred_labels, conf_threshold):
+    tp, fp, fn = 0, 0, 0
+    for gt_box in gt_boxes:
+        matched = False
+        for pred_box, score in zip(pred_boxes, pred_scores):
+            if score >= conf_threshold and iou(gt_box, pred_box) > 0.5:
+                matched = True
+                tp += 1
+                break
+        if not matched:
+            fn += 1
+    fp = len(pred_boxes) - tp
+    precision = tp / (tp + fp + 1e-5)
+    recall = tp / (tp + fn + 1e-5)
+    return precision, recall
+
+# Intersection over Union (IoU) calculation
+def iou(box1, box2):
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+    intersection = max(0, x2 - x1) * max(0, y2 - y1)
+    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union = area1 + area2 - intersection
+    return intersection / (union + 1e-5)
+
+# Function to plot performance metrics by subheadings
+def plot_performance(models_data):
+    sns.set(style="whitegrid")
+    fig, axes = plt.subplots(3, 2, figsize=(16, 16))
+
+    # Accuracy Subheading (mAP, Precision, Recall)
+    axes[0, 0].bar([d['name'] for d in models_data], [d['precision'] for d in models_data], color='blue')
+    axes[0, 0].set_title('Precision Comparison (Accuracy)')
+    axes[0, 0].set_ylabel('Precision')
+
+    axes[0, 1].bar([d['name'] for d in models_data], [d['recall'] for d in models_data], color='green')
+    axes[0, 1].set_title('Recall Comparison (Accuracy)')
+    axes[0, 1].set_ylabel('Recall')
+
+    # Speed Subheading (FPS, Inference Time)
+    axes[1, 0].bar([d['name'] for d in models_data], [d['fps'] for d in models_data], color='orange')
+    axes[1, 0].set_title('FPS Comparison (Speed)')
+    axes[1, 0].set_ylabel('FPS')
+
+    axes[1, 1].bar([d['name'] for d in models_data], [d['inference_time'] for d in models_data], color='red')
+    axes[1, 1].set_title('Inference Time Comparison (Speed)')
+    axes[1, 1].set_ylabel('Inference Time (s)')
+
+    # Resource Utilization (Memory, CPU, GPU)
+    axes[2, 0].bar([d['name'] for d in models_data], [d['memory'] for d in models_data], color='purple')
+    axes[2, 0].set_title('Memory Consumption (Resource Utilization)')
+    axes[2, 0].set_ylabel('Memory Usage (%)')
+
+    axes[2, 1].bar([d['name'] for d in models_data], [d['cpu'] for d in models_data], color='brown')
+    axes[2, 1].set_title('CPU Utilization (Resource Utilization)')
+    axes[2, 1].set_ylabel('CPU Usage (%)')
+
+    plt.tight_layout()
+    plt.show()
+
+# Main function to run the evaluation
+def main():
+    # Load models
+    yolo_model = YOLO('yolov5s.pt')
+    rcnn_model = fasterrcnn_resnet50_fpn(pretrained=True).eval()
+    ssd_model = ssd300_vgg16(pretrained=True).eval()
+
+    # Load COCO dataset
+    coco, img_dir = load_coco_dataset()
+
+    # Evaluate YOLO, Fast R-CNN, and SSD
+    yolo_data = evaluate_model(yolo_model, coco, img_dir, "YOLO")
+    rcnn_data = evaluate_model(rcnn_model, coco, img_dir, "Faster R-CNN")
+    ssd_data = evaluate_model(ssd_model, coco, img_dir, "SSD")
+
+    # Combine results
+    models_data = [yolo_data, rcnn_data, ssd_data]
+
+    # Plot performance metrics
+    plot_performance(models_data)
+
+if __name__ == "__main__":
+    main()
